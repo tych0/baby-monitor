@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
+<title>Baby Monitor</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0b1020; color: #e7ecff;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 28px; padding: env(safe-area-inset-top) 24px env(safe-area-inset-bottom);
+    user-select: none; -webkit-user-select: none;
+  }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: .5px; opacity: .85; margin: 0; }
+  #toggle {
+    width: min(70vw, 260px); height: min(70vw, 260px);
+    border-radius: 50%; border: none; cursor: pointer;
+    font-size: 34px; font-weight: 700; letter-spacing: 1px; color: #fff;
+    background: #2a3354; transition: background .2s, transform .05s, box-shadow .2s;
+    box-shadow: 0 10px 40px rgba(0,0,0,.45);
+  }
+  #toggle:active { transform: scale(.97); }
+  #toggle.live   { background: #1f9d57; box-shadow: 0 0 0 8px rgba(31,157,87,.18), 0 10px 40px rgba(0,0,0,.45); }
+  #toggle.busy   { background: #b8860b; }
+  #toggle.off    { background: #b2374a; }
+  #status { font-size: 16px; min-height: 22px; opacity: .8; text-align: center; }
+  /* Audio-only playback runs through a <video> element (iOS Safari won't reliably
+     play a remote WebRTC stream from an <audio> element). Keep it in the layout
+     but invisible — display:none would stop playback on iOS. */
+  #player { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: #6b7280; }
+  .dot.live { background: #2bd576; animation: pulse 1.6s infinite; }
+  .dot.busy { background: #e0a72b; }
+  .dot.off  { background: #e0556b; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+</style>
+</head>
+<body>
+  <h1>BABY MONITOR</h1>
+  <button id="toggle" class="off">START</button>
+  <div id="status"><span class="dot off"></span>Tap to start listening</div>
+  <video id="player" autoplay playsinline></video>
+
+<script>
+(() => {
+  "use strict";
+  const player = document.getElementById("player");
+  const toggle = document.getElementById("toggle");
+  const status = document.getElementById("status");
+
+  let pc = null;
+  let running = false;          // user intent: should we be listening?
+  let reconnectTimer = null;
+  let backoff = 500;            // ms, grows to a cap on repeated failures
+  let lastBytes = 0, stalls = 0;
+
+  function setUI(state, text) {
+    toggle.className = state;             // live | busy | off
+    toggle.textContent = (state === "off") ? "START" : "STOP";
+    status.innerHTML = `<span class="dot ${state}"></span>${text}`;
+  }
+
+  function cleanupPC() {
+    if (pc) {
+      pc.onconnectionstatechange = null;
+      pc.ontrack = null;
+      try { pc.close(); } catch (_) {}
+      pc = null;
+    }
+  }
+
+  // Wait (briefly) for ICE gathering to finish so the offer carries candidates;
+  // the server uses non-trickle signaling.
+  function iceGatheringComplete(pc) {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => { pc.removeEventListener("icegatheringstatechange", check); resolve(); };
+      const check = () => { if (pc.iceGatheringState === "complete") done(); };
+      pc.addEventListener("icegatheringstatechange", check);
+      setTimeout(done, 2000); // LAN gathers fast; don't wait forever
+    });
+  }
+
+  async function connect() {
+    cleanupPC();
+    setUI("busy", "connecting…");
+    lastBytes = 0; stalls = 0;
+
+    pc = new RTCPeerConnection();        // host candidates only — fine on a LAN
+    pc.addTransceiver("audio", { direction: "recvonly" });
+
+    pc.ontrack = (e) => {
+      player.srcObject = e.streams[0];
+      player.play().catch(onAutoplayBlocked);
+    };
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      const s = pc.connectionState;
+      if (s === "connected") { backoff = 500; setUI("live", "live"); }
+      else if (s === "failed" || s === "disconnected" || s === "closed") { scheduleReconnect(); }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await iceGatheringComplete(pc);
+
+    const resp = await fetch("/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pc.localDescription),
+    });
+    if (!resp.ok) throw new Error("offer rejected: " + resp.status);
+    await pc.setRemoteDescription(await resp.json());
+  }
+
+  function scheduleReconnect() {
+    if (!running || reconnectTimer) return;
+    cleanupPC();
+    setUI("busy", "reconnecting…");
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      if (!running) return;
+      try { await connect(); }
+      catch (_) { backoff = Math.min(backoff * 2, 8000); scheduleReconnect(); }
+    }, backoff);
+    backoff = Math.min(backoff * 2, 8000);
+  }
+
+  // Autoplay was blocked: keep "running" off and let the next tap supply the
+  // user gesture the browser requires before it will play audio.
+  function onAutoplayBlocked() {
+    running = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    cleanupPC();
+    setUI("off", "Tap to start listening");
+  }
+
+  async function start() {
+    running = true;
+    backoff = 500;
+    try { await connect(); }
+    catch (_) { scheduleReconnect(); }
+  }
+
+  function stop() {
+    running = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    cleanupPC();
+    player.srcObject = null;
+    setUI("off", "stopped");
+  }
+
+  toggle.addEventListener("click", () => { running ? stop() : start(); });
+
+  // Media-session controls (lock screen / headset buttons).
+  if ("mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: "Baby Monitor", artist: "Live microphone" });
+      navigator.mediaSession.setActionHandler("play",  () => { if (!running) start(); });
+      navigator.mediaSession.setActionHandler("pause", () => { if (running) stop(); });
+    } catch (_) {}
+  }
+
+  // Watchdog: if audio bytes stop flowing while we think we're connected, the
+  // stream has silently stalled — force a reconnect.
+  setInterval(async () => {
+    if (!running || !pc || pc.connectionState !== "connected") return;
+    try {
+      const stats = await pc.getStats();
+      let bytes = 0;
+      stats.forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "audio") bytes = r.bytesReceived || 0; });
+      if (bytes > lastBytes) { lastBytes = bytes; stalls = 0; }
+      else if (++stalls >= 3) { stalls = 0; scheduleReconnect(); }
+    } catch (_) {}
+  }, 3000);
+
+  // Coming back from a locked/backgrounded screen: make sure we're still live.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !running) return;
+    if (!pc || ["failed", "disconnected", "closed"].includes(pc.connectionState)) scheduleReconnect();
+    else if (player.paused) player.play().catch(() => {});
+  });
+
+  // Stream by default where the browser allows autoplay; otherwise the page
+  // falls back to the tap-to-start button via onAutoplayBlocked().
+  start();
+})();
+</script>
+</body>
+</html>
