@@ -95,6 +95,11 @@
     pc.addTransceiver("audio", { direction: "recvonly" });
 
     pc.ontrack = (e) => {
+      // Keep a larger receiver jitter buffer so a cold start or WiFi hiccup
+      // doesn't cause gaps. ~0.5s of added latency is fine for a monitor.
+      // Two property names for cross-browser coverage; unknown ones are ignored.
+      try { e.receiver.jitterBufferTarget = 500; } catch (_) {}
+      try { e.receiver.playoutDelayHint = 0.5; } catch (_) {}
       player.srcObject = e.streams[0];
       player.play().catch(onAutoplayBlocked);
     };

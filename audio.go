@@ -6,7 +6,9 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -58,10 +60,18 @@ func runFFmpeg(ctx context.Context, source, bitrate string, rtpPort int) error {
 		"-f", "rtp", url,
 	}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	// Have the kernel SIGKILL ffmpeg if this server dies abruptly (e.g. kill -9),
+	// so a capture process can never be orphaned and keep flooding the RTP port.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return err
 	}
+	// Pdeathsig fires when the thread that started the child exits, so pin this
+	// goroutine to its OS thread for the child's whole lifetime (it blocks in
+	// Wait below anyway).
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
