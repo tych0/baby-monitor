@@ -69,8 +69,31 @@ are skipped. (Pick a specific source interface address via `-addr` if needed.)
 | `-rtp-port`  | `5004`   | local UDP port for the ffmpeg→server RTP feed      |
 | `-ice-min`   | `50000`  | min UDP port for WebRTC ICE host candidates        |
 | `-ice-max`   | `50010`  | max UDP port for WebRTC ICE host candidates        |
+| `-tls`       | `false`  | serve HTTPS with a self-signed cert (for talkback) |
 
 List capture sources with `pactl list short sources`; pass one to `-source`.
+
+### Talkback / HTTPS (`-tls`)
+
+Browsers only expose the microphone (`getUserMedia`) in a *secure context*, so
+the **TALK** button is disabled over plain HTTP. To use talkback, run with
+`-tls`:
+
+```sh
+./baby-monitor -tls
+```
+
+The server mints an in-memory self-signed certificate on startup (no CA, no
+files written) covering `localhost`, `127.0.0.1`, and the LAN IP the QR code
+points at, and serves everything over HTTPS. The QR/URL switches to `https://`.
+The first time each phone opens it, accept the browser's certificate warning
+(on iOS Safari: **Show Details → visit this website**) — after that the page is
+a secure context and the mic works. Listening works over either scheme; only
+talkback needs `-tls`.
+
+The certificate is regenerated on every start, so phones re-prompt after a
+restart. If you serve HTTPS, also open `8000/tcp` (or your `-addr` port) in the
+firewall as below.
 
 ## Firewall (Fedora / firewalld)
 
@@ -90,9 +113,10 @@ sudo firewall-cmd --add-port=50000-50010/udp
   doesn't require HTTPS. (If a browser ever refuses, the fallback is self-signed
   HTTPS.)
 - **Talkback needs a secure context** — browsers only expose the microphone
-  (`getUserMedia`) over HTTPS or `localhost`. Over plain LAN HTTP the **TALK**
-  button stays disabled with a "needs HTTPS" hint; listening still works. Serve
-  the page over HTTPS (e.g. a self-signed cert) to enable transmitting.
+  (`getUserMedia`) over HTTPS or `localhost`, so over plain LAN HTTP the **TALK**
+  button stays disabled with a hint (listening still works). Run with `-tls` to
+  serve HTTPS with a self-signed cert; see [Talkback / HTTPS](#talkback--https--tls)
+  above.
 - **Autoplay** — mobile browsers won't play audio until you tap; the big button
   is that first tap. The page tries to start on load and falls back to tap-to-start.
 - **Background playback** — Android Chrome keeps the audio alive with the screen

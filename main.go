@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"embed"
 	"flag"
 	"fmt"
@@ -71,6 +72,7 @@ func main() {
 	rtpPort := flag.Int("rtp-port", 5004, "local UDP port for the ffmpeg->server RTP feed")
 	iceMin := flag.Int("ice-min", 50000, "min UDP port for WebRTC ICE host candidates")
 	iceMax := flag.Int("ice-max", 50010, "max UDP port for WebRTC ICE host candidates")
+	useTLS := flag.Bool("tls", false, "serve HTTPS with an in-memory self-signed cert (required for mic/talkback on iOS; accept the browser warning once)")
 	flag.Parse()
 
 	// Pin the ICE host-candidate UDP range so it can be opened in the firewall.
@@ -87,8 +89,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// With -tls, mint a self-signed cert up front (before printing the URL) so a
+	// failure is loud and the QR code advertises the right https scheme. The cert
+	// must cover the LAN IP the QR points at, since browsers validate the SAN.
+	scheme := "http"
+	var tlsConfig *tls.Config
+	if *useTLS {
+		hosts := []string{"127.0.0.1", "::1", "localhost"}
+		if ip := lanIP(); ip != "" {
+			hosts = append(hosts, ip)
+		}
+		cert, err := selfSignedCert(hosts)
+		if err != nil {
+			log.Fatalf("self-signed cert: %v", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		scheme = "https"
+	}
+
 	// Print the QR/URL first so it isn't interleaved with ffmpeg's log output.
-	printLANURLs(*addr)
+	printLANURLs(scheme, *addr)
 
 	// Supervise ffmpeg and pump its RTP into the shared track for the whole run.
 	go startCapture(ctx, *source, *bitrate, *rtpPort, srv.track)
@@ -98,13 +118,18 @@ func main() {
 	mux.HandleFunc("/offer", srv.handleOffer)
 	mux.HandleFunc("/talk", srv.handleTalk)
 
-	httpServer := &http.Server{Addr: *addr, Handler: mux}
+	httpServer := &http.Server{Addr: *addr, Handler: mux, TLSConfig: tlsConfig}
 	go func() {
 		<-ctx.Done()
 		httpServer.Close()
 	}()
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	serve := httpServer.ListenAndServe
+	if tlsConfig != nil {
+		// Cert/key are supplied via TLSConfig.Certificates, so pass empty paths.
+		serve = func() error { return httpServer.ListenAndServeTLS("", "") }
+	}
+	if err := serve(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 }
@@ -126,8 +151,9 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // printLANURLs prints the LAN URL a phone on the same WiFi should open, as both
 // text and a scannable QR code. Loopback, Docker, and Tailscale addresses are
-// skipped so only the real LAN address is shown.
-func printLANURLs(addr string) {
+// skipped so only the real LAN address is shown. scheme is "http" or (with -tls)
+// "https".
+func printLANURLs(scheme, addr string) {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" {
 		port = "8000"
@@ -137,11 +163,15 @@ func printLANURLs(addr string) {
 		log.Printf("could not find a LAN IPv4 address — is WiFi/ethernet up?")
 		return
 	}
-	url := fmt.Sprintf("http://%s:%s", ip, port)
+	url := fmt.Sprintf("%s://%s:%s", scheme, ip, port)
 
 	fmt.Printf("\n  Scan to open the baby monitor (phone on the same WiFi):\n\n")
 	qrterminal.GenerateHalfBlock(url, qrterminal.L, os.Stdout)
 	fmt.Printf("\n  %s\n\n", url)
+	if scheme == "https" {
+		fmt.Printf("  Self-signed cert: accept the browser's security warning the first time.\n")
+		fmt.Printf("  (Required so the page can use the phone's mic for talkback.)\n\n")
+	}
 }
 
 // lanIP returns the first private IPv4 address on a physical interface, skipping

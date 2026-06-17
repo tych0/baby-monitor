@@ -216,7 +216,7 @@
   // getUserMedia needs a secure context (HTTPS or localhost); over plain LAN
   // HTTP the API is absent. Disable talk and explain rather than failing on tap.
   const secureMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  if (!secureMic) talkhint.textContent = "Talk needs HTTPS (mic access is blocked on plain HTTP).";
+  if (!secureMic) talkhint.textContent = "Talk needs HTTPS — start the server with -tls (mic is blocked on plain HTTP).";
 
   async function ensureMic() {
     if (micTrack && micTrack.readyState === "live") return micTrack;
