@@ -34,6 +34,26 @@ type server struct {
 	track *webrtc.TrackLocalStaticRTP
 }
 
+// newServer builds the shared WebRTC API (using the given SettingEngine, which
+// carries the ICE UDP port range) and the single Opus mic track every phone
+// subscribes to. Splitting this out of main keeps the WebRTC wiring testable.
+func newServer(se webrtc.SettingEngine) (*server, error) {
+	me := &webrtc.MediaEngine{}
+	if err := me.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("register codecs: %w", err)
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se))
+
+	track, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"audio", "baby-monitor",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create track: %w", err)
+	}
+	return &server{api: api, track: track}, nil
+}
+
 func main() {
 	addr := flag.String("addr", ":8000", "HTTP listen address (binds all interfaces so phones can reach it)")
 	source := flag.String("source", "default", "PulseAudio/PipeWire capture source")
@@ -49,18 +69,9 @@ func main() {
 		log.Fatalf("ice udp port range %d-%d: %v", *iceMin, *iceMax, err)
 	}
 
-	me := &webrtc.MediaEngine{}
-	if err := me.RegisterDefaultCodecs(); err != nil {
-		log.Fatalf("register codecs: %v", err)
-	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se))
-
-	track, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		"audio", "baby-monitor",
-	)
+	srv, err := newServer(se)
 	if err != nil {
-		log.Fatalf("create track: %v", err)
+		log.Fatalf("%v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -70,9 +81,8 @@ func main() {
 	printLANURLs(*addr)
 
 	// Supervise ffmpeg and pump its RTP into the shared track for the whole run.
-	go startCapture(ctx, *source, *bitrate, *rtpPort, track)
+	go startCapture(ctx, *source, *bitrate, *rtpPort, srv.track)
 
-	srv := &server{api: api, track: track}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/offer", srv.handleOffer)
