@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/mdp/qrterminal/v3"
@@ -27,11 +28,20 @@ import (
 //go:embed static/index.html
 var staticFS embed.FS
 
-// server holds the shared WebRTC API and the single mic track that every phone
-// subscribes to.
+// server holds the shared WebRTC API, the single mic track that every phone
+// subscribes to, and the registry used to relay push-to-talk audio.
+//
+// Talkback is the reverse direction: a phone holds its talk button, captures
+// its mic, and the server forwards that audio to every *other* connected phone
+// via that phone's per-client talkback track. Only one phone may hold the talk
+// lock (mu/talker) at a time.
 type server struct {
 	api   *webrtc.API
 	track *webrtc.TrackLocalStaticRTP
+
+	mu      sync.Mutex
+	clients map[string]*client // by client id; the active talkback subscribers
+	talker  string             // id of the phone currently holding the mic, or ""
 }
 
 // newServer builds the shared WebRTC API (using the given SettingEngine, which
@@ -51,7 +61,7 @@ func newServer(se webrtc.SettingEngine) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create track: %w", err)
 	}
-	return &server{api: api, track: track}, nil
+	return &server{api: api, track: track, clients: make(map[string]*client)}, nil
 }
 
 func main() {
@@ -86,6 +96,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/offer", srv.handleOffer)
+	mux.HandleFunc("/talk", srv.handleTalk)
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux}
 	go func() {

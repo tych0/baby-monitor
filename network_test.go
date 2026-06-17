@@ -108,10 +108,18 @@ func TestHandleOfferRejectsBadRequests(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/offer", bytes.NewBufferString("not json"))
+	req := httptest.NewRequest(http.MethodPost, "/offer?id=x", bytes.NewBufferString("not json"))
 	srv.handleOffer(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("POST /offer with garbage body = %d, want 400", rec.Code)
+	}
+
+	// An offer without a client id can't be tied to the talk lock, so it's rejected.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/offer", bytes.NewBufferString("{}"))
+	srv.handleOffer(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("POST /offer without id = %d, want 400", rec.Code)
 	}
 }
 
@@ -149,11 +157,22 @@ func TestSignalingForwardsMediaToSubscriber(t *testing.T) {
 	}
 	defer pc.Close()
 
+	// Mirror the browser's three audio m-lines: two recvonly (baby mic +
+	// talkback) and one sendrecv (this phone's mic). The server fans the shared
+	// mic track out onto the first recvonly line.
+	for i := 0; i < 2; i++ {
+		if _, err := pc.AddTransceiverFromKind(
+			webrtc.RTPCodecTypeAudio,
+			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+		); err != nil {
+			t.Fatalf("add recv transceiver %d: %v", i, err)
+		}
+	}
 	if _, err := pc.AddTransceiverFromKind(
 		webrtc.RTPCodecTypeAudio,
-		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv},
 	); err != nil {
-		t.Fatalf("add transceiver: %v", err)
+		t.Fatalf("add send transceiver: %v", err)
 	}
 
 	gotRTP := make(chan struct{}, 1)
@@ -178,7 +197,7 @@ func TestSignalingForwardsMediaToSubscriber(t *testing.T) {
 	}
 	<-gather
 
-	answer := postOffer(t, ts.URL+"/offer", pc.LocalDescription())
+	answer := postOffer(t, ts.URL+"/offer?id=phone", pc.LocalDescription())
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		t.Fatalf("set remote description: %v", err)
 	}
