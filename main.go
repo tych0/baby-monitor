@@ -40,9 +40,10 @@ type server struct {
 	api   *webrtc.API
 	track *webrtc.TrackLocalStaticRTP
 
-	mu      sync.Mutex
-	clients map[string]*client // by client id; the active talkback subscribers
-	talker  string             // id of the phone currently holding the mic, or ""
+	mu         sync.Mutex
+	clients    map[string]*client       // by client id; the active talkback subscribers
+	talker     string                   // id of the phone currently holding the mic, or ""
+	talkerSubs map[chan string]struct{} // SSE listeners notified when talker changes
 }
 
 // newServer builds the shared WebRTC API (using the given SettingEngine, which
@@ -62,7 +63,12 @@ func newServer(se webrtc.SettingEngine) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create track: %w", err)
 	}
-	return &server{api: api, track: track, clients: make(map[string]*client)}, nil
+	return &server{
+		api:        api,
+		track:      track,
+		clients:    make(map[string]*client),
+		talkerSubs: make(map[chan string]struct{}),
+	}, nil
 }
 
 func main() {
@@ -117,6 +123,7 @@ func main() {
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/offer", srv.handleOffer)
 	mux.HandleFunc("/talk", srv.handleTalk)
+	mux.HandleFunc("/events", srv.handleEvents)
 
 	httpServer := &http.Server{Addr: *addr, Handler: mux, TLSConfig: tlsConfig}
 	go func() {

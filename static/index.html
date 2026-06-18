@@ -42,6 +42,7 @@
   #talk.busy { background: #6b4a0b; color: #ffe7b0; border-color: #6b4a0b; }
   #talk[disabled] { opacity: .45; cursor: default; }
   #talkhint { font-size: 13px; min-height: 18px; opacity: .65; text-align: center; }
+  #remote { font-size: 14px; min-height: 20px; text-align: center; color: #e0a72b; font-weight: 600; }
   /* Audio-only playback runs through <video> elements (iOS Safari won't reliably
      play a remote WebRTC stream from an <audio> element). One element per remote
      track: a single element renders only the first audio track of a MediaStream,
@@ -62,6 +63,7 @@
   <div id="status"><span class="dot off"></span>Tap to start listening</div>
   <button id="talk" disabled>TALK</button>
   <div id="talkhint"></div>
+  <div id="remote"></div>
   <div id="sinks"></div>
 
 <script>
@@ -72,6 +74,7 @@
   const status = document.getElementById("status");
   const talk = document.getElementById("talk");
   const talkhint = document.getElementById("talkhint");
+  const remote = document.getElementById("remote");
 
   // Stable per-tab id so the server can tie /offer to /talk (the mic lock).
   const clientId = (crypto.randomUUID && crypto.randomUUID())
@@ -80,6 +83,7 @@
   let pc = null;
   let running = false;          // user intent: should we be listening?
   let transmitting = false;     // user intent: is this phone the mic?
+  let remoteTalker = "";        // id of whichever phone holds the mic (per the server), or ""
   let reconnectTimer = null;
   let backoff = 500;            // ms, grows to a cap on repeated failures
   let lastBytes = 0, stalls = 0;
@@ -125,13 +129,20 @@
     toggle.className = state;             // live | busy | off
     toggle.textContent = (state === "off") ? "START" : "STOP";
     status.innerHTML = `<span class="dot ${state}"></span>${text}`;
-    // Talk is only usable once we have a live connection to relay through.
-    talk.disabled = !running || !secureMic;
+    setTalkUI();
   }
 
+  // setTalkUI reflects both our own transmit state and the server's view of who
+  // holds the mic: the talk button is disabled while another phone is talking
+  // (and shows it as busy), and a banner names that someone else is transmitting.
   function setTalkUI() {
+    const otherTalking = remoteTalker !== "" && remoteTalker !== clientId;
+    // Talk is only usable once we have a live connection and nobody else holds it.
+    talk.disabled = !running || !secureMic || (otherTalking && !transmitting);
     if (transmitting) { talk.className = "tx"; talk.textContent = "TRANSMITTING"; }
+    else if (otherTalking) { talk.className = "busy"; talk.textContent = "TALK"; }
     else { talk.className = ""; talk.textContent = "TALK"; }
+    remote.textContent = otherTalking ? "📢 Another phone is talking" : "";
   }
 
   function cleanupPC() {
@@ -330,6 +341,23 @@
     if (!pc || ["failed", "disconnected", "closed"].includes(pc.connectionState)) scheduleReconnect();
     else if (!transmitting && sinksPaused()) playSinks();
   });
+
+  // Subscribe to the server's talker feed so we can show when another phone is
+  // transmitting and lock out our own talk button while it holds the mic. Each
+  // message is the current talker's id ("" for none). EventSource reconnects on
+  // its own; if the talker changed while we were disconnected the server replays
+  // the current value on resubscribe, so we always converge to the live state.
+  function subscribeTalker() {
+    const es = new EventSource("/events");
+    es.onmessage = (e) => {
+      remoteTalker = e.data || "";
+      // The server is authoritative: if it says we're no longer the talker (lock
+      // lost on a reconnect, say) but we still think we are, drop transmit mode.
+      if (transmitting && remoteTalker !== clientId) setTransmit(false);
+      setTalkUI();
+    };
+  }
+  subscribeTalker();
 
   // Stream by default where the browser allows autoplay; otherwise the page
   // falls back to the tap-to-start button via onAutoplayBlocked().
