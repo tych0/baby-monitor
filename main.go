@@ -44,8 +44,8 @@ type server struct {
 	host  string // hostname shown to phones as the audio source
 
 	mu         sync.Mutex
-	clients    map[string]*client       // by client id; the active talkback subscribers
-	talker     string                   // id of the phone currently holding the mic, or ""
+	clients    map[string]*client           // by client id; the active talkback subscribers
+	talker     string                       // id of the phone currently holding the mic, or ""
 	talkerSubs map[chan talkerInfo]struct{} // SSE listeners notified when talker changes
 }
 
