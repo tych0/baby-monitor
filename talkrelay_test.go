@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -190,8 +191,9 @@ func TestTalkerEventsFeed(t *testing.T) {
 	defer ts.Close()
 
 	// A connected client is required before it can acquire the lock; register one
-	// directly (no media needed for this test).
-	srv.register(&client{id: "a"})
+	// directly (no media needed for this test). Its IP rides the feed so other
+	// phones can name the talker.
+	srv.register(&client{id: "a", ip: "10.0.0.5"})
 
 	// Open the SSE stream and read data: lines as they arrive.
 	resp, err := http.Get(ts.URL + "/events")
@@ -199,37 +201,42 @@ func TestTalkerEventsFeed(t *testing.T) {
 		t.Fatalf("open events: %v", err)
 	}
 	defer resp.Body.Close()
-	lines := make(chan string, 8)
+	lines := make(chan talkerInfo, 8)
 	go func() {
 		sc := bufio.NewScanner(resp.Body)
 		for sc.Scan() {
-			if line := sc.Text(); strings.HasPrefix(line, "data:") {
-				lines <- strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			var info talkerInfo
+			if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &info); err == nil {
+				lines <- info
 			}
 		}
 	}()
 
-	next := func(want string) {
+	next := func(wantID, wantIP string) {
 		t.Helper()
 		select {
 		case got := <-lines:
-			if got != want {
-				t.Fatalf("event = %q, want %q", got, want)
+			if got.ID != wantID || got.IP != wantIP {
+				t.Fatalf("event = %+v, want {ID:%q IP:%q}", got, wantID, wantIP)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for event %q", want)
+			t.Fatalf("timed out waiting for event {ID:%q IP:%q}", wantID, wantIP)
 		}
 	}
 
-	next("") // initial state: nobody talking
+	next("", "") // initial state: nobody talking
 
 	if code := talkOp(t, ts, "a", "acquire"); code != http.StatusNoContent {
 		t.Fatalf("acquire = %d", code)
 	}
-	next("a")
+	next("a", "10.0.0.5")
 
 	if code := talkOp(t, ts, "a", "release"); code != http.StatusNoContent {
 		t.Fatalf("release = %d", code)
 	}
-	next("")
+	next("", "")
 }

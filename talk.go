@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -76,11 +77,34 @@ func (w *talkbackWriter) write(src string, pkt *rtp.Packet) error {
 
 // client is one connected phone. talkback is the server->phone track onto which
 // the active talker's relayed audio is written; it is silent unless some other
-// phone is holding the talk button.
+// phone is holding the talk button. ip is the phone's LAN address, used so other
+// phones can show the talker's generated name.
 type client struct {
 	id       string
+	ip       string
 	pc       *webrtc.PeerConnection
 	talkback *talkbackWriter
+}
+
+// talkerInfo is what the /events stream reports: the id of the phone holding the
+// mic (so a phone can tell whether it's itself) and that phone's LAN IP (from
+// which every page derives the same human-friendly name). Both are empty when no
+// one holds the mic.
+type talkerInfo struct {
+	ID string `json:"id"`
+	IP string `json:"ip"`
+}
+
+// currentTalkerLocked returns the active talker's id and IP. Must hold s.mu.
+func (s *server) currentTalkerLocked() talkerInfo {
+	if s.talker == "" {
+		return talkerInfo{}
+	}
+	info := talkerInfo{ID: s.talker}
+	if c, ok := s.clients[s.talker]; ok {
+		info.IP = c.ip
+	}
+	return info
 }
 
 // register adds (or replaces) the client for id, closing any prior connection
@@ -175,15 +199,15 @@ func (s *server) handleTalk(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// subscribeTalker registers a channel that receives the current talker id (and
+// subscribeTalker registers a channel that receives the current talker (and
 // every later change). It returns the channel, primed with the current value,
 // plus an unsubscribe func. Callers must drain promptly; sends are coalesced so
 // a slow reader only ever misses intermediate states, never the latest one.
-func (s *server) subscribeTalker() (<-chan string, func()) {
-	ch := make(chan string, 1)
+func (s *server) subscribeTalker() (<-chan talkerInfo, func()) {
+	ch := make(chan talkerInfo, 1)
 	s.mu.Lock()
 	s.talkerSubs[ch] = struct{}{}
-	ch <- s.talker
+	ch <- s.currentTalkerLocked()
 	s.mu.Unlock()
 	return ch, func() {
 		s.mu.Lock()
@@ -192,20 +216,21 @@ func (s *server) subscribeTalker() (<-chan string, func()) {
 	}
 }
 
-// broadcastTalkerLocked pushes the current talker id to every subscriber. It
-// must be called with s.mu held. Sends never block: a subscriber whose buffer is
-// full has its pending (now-stale) value replaced with the latest one.
+// broadcastTalkerLocked pushes the current talker to every subscriber. It must be
+// called with s.mu held. Sends never block: a subscriber whose buffer is full has
+// its pending (now-stale) value replaced with the latest one.
 func (s *server) broadcastTalkerLocked() {
+	info := s.currentTalkerLocked()
 	for ch := range s.talkerSubs {
 		select {
-		case ch <- s.talker:
+		case ch <- info:
 		default:
 			select {
 			case <-ch:
 			default:
 			}
 			select {
-			case ch <- s.talker:
+			case ch <- info:
 			default:
 			}
 		}
@@ -213,8 +238,9 @@ func (s *server) broadcastTalkerLocked() {
 }
 
 // handleEvents is a Server-Sent Events stream that tells each phone who currently
-// holds the mic, so receivers can show "another phone is talking" and reflect the
-// talk button as busy. Each message is the talker's client id, or empty for none.
+// holds the mic, so receivers can show who is talking and reflect the talk button
+// as busy. Each message is a JSON talkerInfo, with empty fields when no one holds
+// the mic.
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -233,7 +259,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case talker := <-updates:
-			fmt.Fprintf(w, "data: %s\n\n", talker)
+			payload, err := json.Marshal(talker)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", payload)
 			flusher.Flush()
 		}
 	}
