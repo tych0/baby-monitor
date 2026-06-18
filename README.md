@@ -5,11 +5,19 @@ latency, Opus audio). Open the page on a phone, tap **START**, and listen. The
 page keeps playing with the screen off until you tap **STOP**, and it
 auto-reconnects if the connection drops.
 
+There's also **talkback**: tap the small **TALK** button to latch a phone into
+transmit mode. Its microphone is then relayed to every *other* connected phone,
+so you can answer back. Only one phone can be the mic at a time; tap **TALK**
+again to drop back to listening.
+
 ## How it works
 
 ```
-mic ──► ffmpeg (Opus/RTP) ──UDP──► baby-monitor ──WebRTC──► phone browser
+mic ──► ffmpeg (Opus/RTP) ──UDP──► baby-monitor ──WebRTC──► phone browsers
         (PulseAudio/PipeWire)       (pion/webrtc, one shared track → all phones)
+
+                       talking phone ──WebRTC──► baby-monitor ──► other phones'
+                       (mic, push to talk)        (relayed to the non-talkers)
 ```
 
 A single `ffmpeg` process captures the default audio source and sends Opus RTP
@@ -17,6 +25,14 @@ to a local UDP port. The Go server forwards those packets into one shared WebRTC
 track that every connected phone subscribes to, so the mic is captured once no
 matter how many phones are listening. Signaling is a single `POST /offer`
 (non-trickle ICE); the page is served from `/`.
+
+**Talkback** rides the same peer connection. Each phone also offers a send
+direction for its own mic plus a per-phone "talkback" track it receives on. When
+a phone latches into transmit mode it grabs a server-side lock (`POST /talk`,
+returning `409` if another phone already holds it), and the server relays that
+phone's incoming RTP onto every other phone's talkback track. The talker pauses
+its own playback while transmitting to avoid feeding its speaker back into the
+mic.
 
 ## Requirements
 
@@ -53,8 +69,31 @@ are skipped. (Pick a specific source interface address via `-addr` if needed.)
 | `-rtp-port`  | `5004`   | local UDP port for the ffmpeg→server RTP feed      |
 | `-ice-min`   | `50000`  | min UDP port for WebRTC ICE host candidates        |
 | `-ice-max`   | `50010`  | max UDP port for WebRTC ICE host candidates        |
+| `-tls`       | `false`  | serve HTTPS with a self-signed cert (for talkback) |
 
 List capture sources with `pactl list short sources`; pass one to `-source`.
+
+### Talkback / HTTPS (`-tls`)
+
+Browsers only expose the microphone (`getUserMedia`) in a *secure context*, so
+the **TALK** button is disabled over plain HTTP. To use talkback, run with
+`-tls`:
+
+```sh
+./baby-monitor -tls
+```
+
+The server mints an in-memory self-signed certificate on startup (no CA, no
+files written) covering `localhost`, `127.0.0.1`, and the LAN IP the QR code
+points at, and serves everything over HTTPS. The QR/URL switches to `https://`.
+The first time each phone opens it, accept the browser's certificate warning
+(on iOS Safari: **Show Details → visit this website**) — after that the page is
+a secure context and the mic works. Listening works over either scheme; only
+talkback needs `-tls`.
+
+The certificate is regenerated on every start, so phones re-prompt after a
+restart. If you serve HTTPS, also open `8000/tcp` (or your `-addr` port) in the
+firewall as below.
 
 ## Firewall (Fedora / firewalld)
 
@@ -70,8 +109,14 @@ sudo firewall-cmd --add-port=50000-50010/udp
 ## Notes & limitations
 
 - **Open on the LAN** — anyone on your WiFi who knows the URL can listen. No auth.
-- **Plain HTTP is fine** — the phone only *receives* audio, which doesn't require
-  HTTPS. (If a browser ever refuses, the fallback is self-signed HTTPS.)
+- **Plain HTTP is fine for listening** — the phone only *receives* audio, which
+  doesn't require HTTPS. (If a browser ever refuses, the fallback is self-signed
+  HTTPS.)
+- **Talkback needs a secure context** — browsers only expose the microphone
+  (`getUserMedia`) over HTTPS or `localhost`, so over plain LAN HTTP the **TALK**
+  button stays disabled with a hint (listening still works). Run with `-tls` to
+  serve HTTPS with a self-signed cert; see [Talkback / HTTPS](#talkback--https--tls)
+  above.
 - **Autoplay** — mobile browsers won't play audio until you tap; the big button
   is that first tap. The page tries to start on load and falls back to tap-to-start.
 - **Background playback** — Android Chrome keeps the audio alive with the screen

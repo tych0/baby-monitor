@@ -13,7 +13,7 @@
     font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     background: #0b1020; color: #e7ecff;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 28px; padding: env(safe-area-inset-top) 24px env(safe-area-inset-bottom);
+    gap: 22px; padding: env(safe-area-inset-top) 24px env(safe-area-inset-bottom);
     user-select: none; -webkit-user-select: none;
   }
   h1 { font-size: 20px; font-weight: 600; letter-spacing: .5px; opacity: .85; margin: 0; }
@@ -29,6 +29,19 @@
   #toggle.busy   { background: #b8860b; }
   #toggle.off    { background: #b2374a; }
   #status { font-size: 16px; min-height: 22px; opacity: .8; text-align: center; }
+  /* The talk button is deliberately small: it latches this phone into transmit
+     mode (its mic is sent to all other phones) until tapped again. */
+  #talk {
+    width: min(46vw, 180px); height: 52px; border-radius: 26px;
+    border: 1px solid #3a456e; cursor: pointer;
+    font-size: 15px; font-weight: 700; letter-spacing: .6px; color: #cfd7ff;
+    background: #1b2240; transition: background .2s, transform .05s, box-shadow .2s, opacity .2s;
+  }
+  #talk:active { transform: scale(.97); }
+  #talk.tx   { background: #c0392b; color: #fff; border-color: #c0392b; box-shadow: 0 0 0 6px rgba(192,57,43,.18); }
+  #talk.busy { background: #6b4a0b; color: #ffe7b0; border-color: #6b4a0b; }
+  #talk[disabled] { opacity: .45; cursor: default; }
+  #talkhint { font-size: 13px; min-height: 18px; opacity: .65; text-align: center; }
   /* Audio-only playback runs through a <video> element (iOS Safari won't reliably
      play a remote WebRTC stream from an <audio> element). Keep it in the layout
      but invisible — display:none would stop playback on iOS. */
@@ -44,6 +57,8 @@
   <h1>BABY MONITOR</h1>
   <button id="toggle" class="off">START</button>
   <div id="status"><span class="dot off"></span>Tap to start listening</div>
+  <button id="talk" disabled>TALK</button>
+  <div id="talkhint"></div>
   <video id="player" autoplay playsinline></video>
 
 <script>
@@ -52,17 +67,33 @@
   const player = document.getElementById("player");
   const toggle = document.getElementById("toggle");
   const status = document.getElementById("status");
+  const talk = document.getElementById("talk");
+  const talkhint = document.getElementById("talkhint");
+
+  // Stable per-tab id so the server can tie /offer to /talk (the mic lock).
+  const clientId = (crypto.randomUUID && crypto.randomUUID())
+    || (Date.now() + "-" + Math.random().toString(16).slice(2));
 
   let pc = null;
   let running = false;          // user intent: should we be listening?
+  let transmitting = false;     // user intent: is this phone the mic?
   let reconnectTimer = null;
   let backoff = 500;            // ms, grows to a cap on repeated failures
   let lastBytes = 0, stalls = 0;
+  let inbound = null;           // MediaStream carrying baby mic + talkback
+  let micStream = null, micTrack = null, micSender = null;
 
   function setUI(state, text) {
     toggle.className = state;             // live | busy | off
     toggle.textContent = (state === "off") ? "START" : "STOP";
     status.innerHTML = `<span class="dot ${state}"></span>${text}`;
+    // Talk is only usable once we have a live connection to relay through.
+    talk.disabled = !running || !secureMic;
+  }
+
+  function setTalkUI() {
+    if (transmitting) { talk.className = "tx"; talk.textContent = "TRANSMITTING"; }
+    else { talk.className = ""; talk.textContent = "TALK"; }
   }
 
   function cleanupPC() {
@@ -71,6 +102,7 @@
       pc.ontrack = null;
       try { pc.close(); } catch (_) {}
       pc = null;
+      micSender = null;
     }
   }
 
@@ -92,21 +124,36 @@
     lastBytes = 0; stalls = 0;
 
     pc = new RTCPeerConnection();        // host candidates only — fine on a LAN
+    // m-line order matters: the server fills the two recvonly lines (baby mic,
+    // talkback) in order, then treats the third as our outgoing mic.
     pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    micSender = pc.addTransceiver("audio", { direction: "sendrecv" }).sender;
 
+    inbound = new MediaStream();
+    player.srcObject = inbound;
     pc.ontrack = (e) => {
       // Keep a larger receiver jitter buffer so a cold start or WiFi hiccup
       // doesn't cause gaps. ~0.5s of added latency is fine for a monitor.
       // Two property names for cross-browser coverage; unknown ones are ignored.
       try { e.receiver.jitterBufferTarget = 500; } catch (_) {}
       try { e.receiver.playoutDelayHint = 0.5; } catch (_) {}
-      player.srcObject = e.streams[0];
-      player.play().catch(onAutoplayBlocked);
+      inbound.addTrack(e.track);
+      if (!transmitting) player.play().catch(onAutoplayBlocked);
     };
     pc.onconnectionstatechange = () => {
       if (!pc) return;
       const s = pc.connectionState;
-      if (s === "connected") { backoff = 500; setUI("live", "live"); }
+      if (s === "connected") {
+        backoff = 500;
+        setUI("live", transmitting ? "transmitting" : "live");
+        // Re-apply the mic to the fresh connection if we reconnected mid-talk;
+        // the server keeps our lock across reconnects.
+        if (transmitting && micTrack && micSender) {
+          micSender.replaceTrack(micTrack).catch(() => {});
+          micTrack.enabled = true;
+        }
+      }
       else if (s === "failed" || s === "disconnected" || s === "closed") { scheduleReconnect(); }
     };
 
@@ -114,7 +161,7 @@
     await pc.setLocalDescription(offer);
     await iceGatheringComplete(pc);
 
-    const resp = await fetch("/offer", {
+    const resp = await fetch("/offer?id=" + encodeURIComponent(clientId), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(pc.localDescription),
@@ -154,13 +201,67 @@
 
   function stop() {
     running = false;
+    if (transmitting) setTransmit(false);
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     cleanupPC();
+    if (inbound) { inbound.getTracks().forEach((t) => inbound.removeTrack(t)); }
     player.srcObject = null;
     setUI("off", "stopped");
   }
 
   toggle.addEventListener("click", () => { running ? stop() : start(); });
+
+  // --- Push-to-talk (latching transmit mode) -----------------------------
+
+  // getUserMedia needs a secure context (HTTPS or localhost); over plain LAN
+  // HTTP the API is absent. Disable talk and explain rather than failing on tap.
+  const secureMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  if (!secureMic) talkhint.textContent = "Talk needs HTTPS — start the server with -tls (mic is blocked on plain HTTP).";
+
+  async function ensureMic() {
+    if (micTrack && micTrack.readyState === "live") return micTrack;
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micTrack = micStream.getAudioTracks()[0];
+    micTrack.enabled = false;
+    return micTrack;
+  }
+
+  // Latch this phone into (or out of) transmit mode. While transmitting we are
+  // the single mic: the server relays our audio to every other phone, and we
+  // pause our own playback to avoid feeding our speaker back into the mic.
+  async function setTransmit(on) {
+    if (on) {
+      if (!running || !secureMic) return;
+      talkhint.textContent = "";
+      let t;
+      try { t = await ensureMic(); }
+      catch (_) { talkhint.textContent = "Microphone permission denied."; return; }
+
+      const resp = await fetch(`/talk?id=${encodeURIComponent(clientId)}&op=acquire`, { method: "POST" });
+      if (resp.status === 409) { talk.className = "busy"; talkhint.textContent = "Another phone is transmitting."; return; }
+      if (!resp.ok) { talkhint.textContent = "Could not start transmitting."; return; }
+
+      transmitting = true;
+      if (micSender) await micSender.replaceTrack(t).catch(() => {});
+      t.enabled = true;
+      player.pause();
+      setTalkUI();
+      setUI("live", "transmitting");
+    } else {
+      transmitting = false;
+      if (micTrack) micTrack.enabled = false;
+      if (micSender) micSender.replaceTrack(null).catch(() => {});
+      // Best-effort lock release (ignored if we never held it).
+      fetch(`/talk?id=${encodeURIComponent(clientId)}&op=release`, { method: "POST" }).catch(() => {});
+      talkhint.textContent = "";
+      setTalkUI();
+      if (running) { setUI("live", "live"); player.play().catch(() => {}); }
+    }
+  }
+
+  talk.addEventListener("click", () => { transmitting ? setTransmit(false) : setTransmit(true); });
 
   // Media-session controls (lock screen / headset buttons).
   if ("mediaSession" in navigator) {
@@ -172,9 +273,10 @@
   }
 
   // Watchdog: if audio bytes stop flowing while we think we're connected, the
-  // stream has silently stalled — force a reconnect.
+  // stream has silently stalled — force a reconnect. (Skip while transmitting:
+  // we intentionally aren't receiving then.)
   setInterval(async () => {
-    if (!running || !pc || pc.connectionState !== "connected") return;
+    if (!running || transmitting || !pc || pc.connectionState !== "connected") return;
     try {
       const stats = await pc.getStats();
       let bytes = 0;
@@ -188,7 +290,7 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible" || !running) return;
     if (!pc || ["failed", "disconnected", "closed"].includes(pc.connectionState)) scheduleReconnect();
-    else if (player.paused) player.play().catch(() => {});
+    else if (!transmitting && player.paused) player.play().catch(() => {});
   });
 
   // Stream by default where the browser allows autoplay; otherwise the page
