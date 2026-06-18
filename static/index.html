@@ -42,10 +42,13 @@
   #talk.busy { background: #6b4a0b; color: #ffe7b0; border-color: #6b4a0b; }
   #talk[disabled] { opacity: .45; cursor: default; }
   #talkhint { font-size: 13px; min-height: 18px; opacity: .65; text-align: center; }
-  /* Audio-only playback runs through a <video> element (iOS Safari won't reliably
-     play a remote WebRTC stream from an <audio> element). Keep it in the layout
-     but invisible — display:none would stop playback on iOS. */
-  #player { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  /* Audio-only playback runs through <video> elements (iOS Safari won't reliably
+     play a remote WebRTC stream from an <audio> element). One element per remote
+     track: a single element renders only the first audio track of a MediaStream,
+     so the baby mic and the talkback each need their own sink or talkback is
+     silently dropped. Keep them in the layout but invisible — display:none would
+     stop playback on iOS. */
+  .sink { position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: #6b7280; }
   .dot.live { background: #2bd576; animation: pulse 1.6s infinite; }
   .dot.busy { background: #e0a72b; }
@@ -59,12 +62,12 @@
   <div id="status"><span class="dot off"></span>Tap to start listening</div>
   <button id="talk" disabled>TALK</button>
   <div id="talkhint"></div>
-  <video id="player" autoplay playsinline></video>
+  <div id="sinks"></div>
 
 <script>
 (() => {
   "use strict";
-  const player = document.getElementById("player");
+  const sinks = document.getElementById("sinks");
   const toggle = document.getElementById("toggle");
   const status = document.getElementById("status");
   const talk = document.getElementById("talk");
@@ -80,8 +83,43 @@
   let reconnectTimer = null;
   let backoff = 500;            // ms, grows to a cap on repeated failures
   let lastBytes = 0, stalls = 0;
-  let inbound = null;           // MediaStream carrying baby mic + talkback
   let micStream = null, micTrack = null, micSender = null;
+
+  // One playback element per remote track (baby mic, talkback). A single media
+  // element only renders the first audio track of a MediaStream, so mixing both
+  // into one element silently drops the talkback; give each its own sink.
+  // Keyed by the MediaStreamTrack so we can tear an element down when its track
+  // ends (e.g. on reconnect).
+  const trackSinks = new Map();
+
+  function addSink(track) {
+    const el = document.createElement("video");
+    el.className = "sink";
+    el.autoplay = true;
+    el.playsInline = true;
+    el.srcObject = new MediaStream([track]);
+    sinks.appendChild(el);
+    trackSinks.set(track, el);
+    track.addEventListener("ended", () => dropSink(track));
+    if (!transmitting) el.play().catch(onAutoplayBlocked);
+  }
+
+  function dropSink(track) {
+    const el = trackSinks.get(track);
+    if (!el) return;
+    el.srcObject = null;
+    el.remove();
+    trackSinks.delete(track);
+  }
+
+  function clearSinks() {
+    trackSinks.forEach((el) => { el.srcObject = null; el.remove(); });
+    trackSinks.clear();
+  }
+
+  function playSinks() { trackSinks.forEach((el) => el.play().catch(() => {})); }
+  function pauseSinks() { trackSinks.forEach((el) => el.pause()); }
+  function sinksPaused() { for (const el of trackSinks.values()) { if (el.paused) return true; } return false; }
 
   function setUI(state, text) {
     toggle.className = state;             // live | busy | off
@@ -130,16 +168,14 @@
     pc.addTransceiver("audio", { direction: "recvonly" });
     micSender = pc.addTransceiver("audio", { direction: "sendrecv" }).sender;
 
-    inbound = new MediaStream();
-    player.srcObject = inbound;
+    clearSinks();
     pc.ontrack = (e) => {
       // Keep a larger receiver jitter buffer so a cold start or WiFi hiccup
       // doesn't cause gaps. ~0.5s of added latency is fine for a monitor.
       // Two property names for cross-browser coverage; unknown ones are ignored.
       try { e.receiver.jitterBufferTarget = 500; } catch (_) {}
       try { e.receiver.playoutDelayHint = 0.5; } catch (_) {}
-      inbound.addTrack(e.track);
-      if (!transmitting) player.play().catch(onAutoplayBlocked);
+      addSink(e.track);
     };
     pc.onconnectionstatechange = () => {
       if (!pc) return;
@@ -204,8 +240,7 @@
     if (transmitting) setTransmit(false);
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     cleanupPC();
-    if (inbound) { inbound.getTracks().forEach((t) => inbound.removeTrack(t)); }
-    player.srcObject = null;
+    clearSinks();
     setUI("off", "stopped");
   }
 
@@ -246,7 +281,7 @@
       transmitting = true;
       if (micSender) await micSender.replaceTrack(t).catch(() => {});
       t.enabled = true;
-      player.pause();
+      pauseSinks();
       setTalkUI();
       setUI("live", "transmitting");
     } else {
@@ -257,7 +292,7 @@
       fetch(`/talk?id=${encodeURIComponent(clientId)}&op=release`, { method: "POST" }).catch(() => {});
       talkhint.textContent = "";
       setTalkUI();
-      if (running) { setUI("live", "live"); player.play().catch(() => {}); }
+      if (running) { setUI("live", "live"); playSinks(); }
     }
   }
 
@@ -279,8 +314,11 @@
     if (!running || transmitting || !pc || pc.connectionState !== "connected") return;
     try {
       const stats = await pc.getStats();
+      // Sum across both inbound audio receivers (baby mic + talkback); reading a
+      // single one risks latching onto the usually-idle talkback and reconnecting
+      // in a loop. The baby mic always flows, so the total keeps climbing.
       let bytes = 0;
-      stats.forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "audio") bytes = r.bytesReceived || 0; });
+      stats.forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "audio") bytes += r.bytesReceived || 0; });
       if (bytes > lastBytes) { lastBytes = bytes; stalls = 0; }
       else if (++stalls >= 3) { stalls = 0; scheduleReconnect(); }
     } catch (_) {}
@@ -290,7 +328,7 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible" || !running) return;
     if (!pc || ["failed", "disconnected", "closed"].includes(pc.connectionState)) scheduleReconnect();
-    else if (!transmitting && player.paused) player.play().catch(() => {});
+    else if (!transmitting && sinksPaused()) playSinks();
   });
 
   // Stream by default where the browser allows autoplay; otherwise the page
