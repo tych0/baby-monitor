@@ -20,6 +20,7 @@ func newTalkTestServer(t *testing.T) (*server, *httptest.Server) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/offer", srv.handleOffer)
 	mux.HandleFunc("/talk", srv.handleTalk)
+	mux.HandleFunc("/events", srv.handleEvents)
 	return srv, httptest.NewServer(mux)
 }
 

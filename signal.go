@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 
 	"github.com/pion/webrtc/v4"
@@ -85,19 +86,24 @@ func (s *server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		}(rtpSender)
 	}
 
-	c := &client{id: id, pc: pc, talkback: talkback}
+	// Remember the phone's LAN IP so other phones can name it as the talker; it
+	// matches the address /info reports, so every page derives the same name.
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	c := &client{id: id, ip: ip, pc: pc, talkback: &talkbackWriter{track: talkback}}
 	s.register(c)
 
 	// The phone's mic arrives here once it starts talking; forward each packet
 	// to the other phones (gated by the talk lock inside relayTalk).
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		buf := make([]byte, 1600)
 		for {
-			n, _, err := remote.Read(buf)
+			pkt, _, err := remote.ReadRTP()
 			if err != nil {
 				return
 			}
-			s.relayTalk(c, buf[:n])
+			s.relayTalk(c, pkt)
 		}
 	})
 

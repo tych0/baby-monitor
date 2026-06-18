@@ -30,9 +30,15 @@ matter how many phones are listening. Signaling is a single `POST /offer`
 direction for its own mic plus a per-phone "talkback" track it receives on. When
 a phone latches into transmit mode it grabs a server-side lock (`POST /talk`,
 returning `409` if another phone already holds it), and the server relays that
-phone's incoming RTP onto every other phone's talkback track. The talker pauses
-its own playback while transmitting to avoid feeding its speaker back into the
-mic.
+phone's incoming RTP onto every other phone's talkback track. As it relays, the
+server rewrites the outgoing sequence numbers and timestamps so a talker switch
+stays continuous on each receiver's track instead of glitching its jitter buffer.
+The talker pauses its own playback while transmitting to avoid feeding its
+speaker back into the mic.
+
+Every phone also subscribes to a Server-Sent Events stream (`GET /events`) that
+reports who currently holds the mic, so receivers show "another phone is talking"
+and grey out their own **TALK** button while someone else is transmitting.
 
 ## Requirements
 
