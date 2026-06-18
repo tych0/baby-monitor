@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -30,7 +31,8 @@ import (
 var staticFS embed.FS
 
 // server holds the shared WebRTC API, the single mic track that every phone
-// subscribes to, and the registry used to relay push-to-talk audio.
+// subscribes to, and the registry used to relay push-to-talk audio. host is the
+// machine name shown to phones as the audio source.
 //
 // Talkback is the reverse direction: a phone holds its talk button, captures
 // its mic, and the server forwards that audio to every *other* connected phone
@@ -39,6 +41,7 @@ var staticFS embed.FS
 type server struct {
 	api   *webrtc.API
 	track *webrtc.TrackLocalStaticRTP
+	host  string // hostname shown to phones as the audio source
 
 	mu      sync.Mutex
 	clients map[string]*client // by client id; the active talkback subscribers
@@ -62,7 +65,13 @@ func newServer(se webrtc.SettingEngine) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create track: %w", err)
 	}
-	return &server{api: api, track: track, clients: make(map[string]*client)}, nil
+
+	// The hostname identifies this machine to phones as the audio source.
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "baby-monitor"
+	}
+	return &server{api: api, track: track, host: host, clients: make(map[string]*client)}, nil
 }
 
 func main() {
@@ -115,6 +124,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
+	mux.HandleFunc("/info", srv.handleInfo)
 	mux.HandleFunc("/offer", srv.handleOffer)
 	mux.HandleFunc("/talk", srv.handleTalk)
 
@@ -147,6 +157,18 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
+}
+
+// handleInfo reports this server's identity (so the page can show which mic it's
+// hearing) and the phone's own LAN IP (which the browser hides), from which the
+// page derives a stable per-device name.
+func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"host": s.host, "ip": ip})
 }
 
 // printLANURLs prints the LAN URL a phone on the same WiFi should open, as both

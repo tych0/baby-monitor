@@ -42,6 +42,7 @@
   #talk.busy { background: #6b4a0b; color: #ffe7b0; border-color: #6b4a0b; }
   #talk[disabled] { opacity: .45; cursor: default; }
   #talkhint { font-size: 13px; min-height: 18px; opacity: .65; text-align: center; }
+  #source, #device { font-size: 14px; min-height: 18px; opacity: .55; text-align: center; letter-spacing: .3px; }
   /* Audio-only playback runs through a <video> element (iOS Safari won't reliably
      play a remote WebRTC stream from an <audio> element). Keep it in the layout
      but invisible — display:none would stop playback on iOS. */
@@ -59,6 +60,8 @@
   <div id="status"><span class="dot off"></span>Tap to start listening</div>
   <button id="talk" disabled>TALK</button>
   <div id="talkhint"></div>
+  <div id="source"></div>
+  <div id="device"></div>
   <video id="player" autoplay playsinline></video>
 
 <script>
@@ -69,10 +72,38 @@
   const status = document.getElementById("status");
   const talk = document.getElementById("talk");
   const talkhint = document.getElementById("talkhint");
+  const source = document.getElementById("source");
+  const device = document.getElementById("device");
 
   // Stable per-tab id so the server can tie /offer to /talk (the mic lock).
   const clientId = (crypto.randomUUID && crypto.randomUUID())
     || (Date.now() + "-" + Math.random().toString(16).slice(2));
+
+  const ADJECTIVES = ["Brave", "Calm", "Clever", "Cosy", "Fuzzy", "Gentle", "Happy", "Jolly",
+                      "Lucky", "Mellow", "Nimble", "Plucky", "Quiet", "Snug", "Sunny", "Witty"];
+  const ANIMALS = ["Otter", "Panda", "Fox", "Koala", "Robin", "Badger", "Heron", "Lynx",
+                   "Moose", "Owl", "Puffin", "Quokka", "Seal", "Tapir", "Wren", "Yak"];
+
+  // Derive a stable name from the phone's LAN IP (the server reports it; browsers
+  // hide both the device's real name and its local IP). The same phone keeps the
+  // same name across reloads. Hashing the whole address (FNV-1a) — not just the
+  // last octet — means every octet contributes and neighbouring IPs scatter; the
+  // hash picks an adjective, an animal, and a 2-digit number, so the space is
+  // 16 x 16 x 100 = 25,600 and collisions stay unlikely well past a dozen phones.
+  function nameFromIP(ip) {
+    let h = 2166136261;                                       // FNV-1a 32-bit
+    for (const ch of (ip || "?")) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+    h = (h ^ (h >>> 16)) >>> 0;
+    const num = String((h >>> 8) % 100).padStart(2, "0");
+    return ADJECTIVES[h & 15] + " " + ANIMALS[(h >>> 4) & 15] + " " + num;
+  }
+
+  // Show which machine's mic this phone hears (server hostname) and this phone's
+  // own generated name, both derived from the server's /info response.
+  fetch("/info").then((r) => r.json()).then((d) => {
+    if (d && d.host) source.textContent = "🎙 " + d.host;
+    device.textContent = "📱 " + nameFromIP(d && d.ip);
+  }).catch(() => {});
 
   let pc = null;
   let running = false;          // user intent: should we be listening?
