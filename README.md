@@ -115,6 +115,10 @@ sudo firewall-cmd --add-port=50000-50010/udp
 ## Notes & limitations
 
 - **Open on the LAN** — anyone on your WiFi who knows the URL can listen. No auth.
+- **VPN/virtual interfaces are skipped** — both the advertised URL and the WebRTC
+  ICE candidates ignore `tailscale0`, `docker0`, VPNs, etc., so a phone that also
+  shares the tailnet doesn't stall trying to reach an unreachable VPN candidate.
+  Connections use the real LAN interface only.
 - **Plain HTTP is fine for listening** — the phone only *receives* audio, which
   doesn't require HTTPS. (If a browser ever refuses, the fallback is self-signed
   HTTPS.)

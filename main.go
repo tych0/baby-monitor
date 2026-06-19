@@ -96,6 +96,13 @@ func main() {
 	if err := se.SetEphemeralUDPPortRange(uint16(*iceMin), uint16(*iceMax)); err != nil {
 		log.Fatalf("ice udp port range %d-%d: %v", *iceMin, *iceMax, err)
 	}
+	// Only gather ICE candidates on real LAN interfaces — skip tailscale0,
+	// docker0, VPNs, etc. Otherwise pion advertises host candidates on those
+	// interfaces in the SDP answer; a phone that shares the tailnet wastes its
+	// connectivity checks on an unreachable 100.64/10 candidate and the
+	// connection stalls. Mirrors the interface filtering lanIP already does for
+	// the QR URL, reusing the same predicate so the two stay in sync.
+	se.SetInterfaceFilter(func(name string) bool { return !isVirtualIface(name) })
 
 	srv, err := newServer(se)
 	if err != nil {
